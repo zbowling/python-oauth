@@ -2,6 +2,7 @@
 The MIT License
 
 Copyright (c) 2007 Leah Culver
+Copyright (c) 2010 Zac Bowling
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -78,10 +79,14 @@ class OAuthConsumer(object):
     """
     key = None
     secret = None
-
-    def __init__(self, key, secret):
+    supports_xauth = False
+    supports_deferred_auth = False
+    
+    def __init__(self, key, secret, supports_xauth=False, supports_deferred_auth=False):
         self.key = key
         self.secret = secret
+        self.supports_xauth = supports_xauth
+        self.supports_deferred_auth = supports_deferred_auth
 
 
 class OAuthToken(object):
@@ -97,6 +102,7 @@ class OAuthToken(object):
     callback = None
     callback_confirmed = None
     verifier = None
+    userid = None
 
     def __init__(self, key, secret):
         self.key = key
@@ -195,24 +201,33 @@ class OAuthRequest(object):
         parameters = {}
         for k, v in self.parameters.iteritems():
             # Ignore oauth parameters.
-            if k.find('oauth_') < 0:
+            if not k.startswith('oauth_') and not k.startswith('x_oauth_'):
                 parameters[k] = v
         return parameters
 
     def to_header(self, realm=''):
         """Serialize as a header for an HTTPAuth request."""
         auth_header = 'OAuth realm="%s"' % realm
+        heads = {}
         # Add the oauth parameters.
         if self.parameters:
             for k, v in self.parameters.iteritems():
-                if k[:6] == 'oauth_':
-                    auth_header += ', %s="%s"' % (k, escape(str(v)))
-        return {'Authorization': auth_header}
+                #if k[:6] == 'oauth_':
+                auth_header += ', %s="%s"' % (k, escape(str(v)))
+                #else: 
+                    #heads[k] = v
+        heads['Authorization'] = auth_header
+        return heads
 
     def to_postdata(self):
         """Serialize as post data for a POST request."""
         return '&'.join(['%s=%s' % (escape(str(k)), escape(str(v))) \
             for k, v in self.parameters.iteritems()])
+    
+    def to_nonauth_getdata(self):
+        """Serialize params for a GET request with OAuth in header."""
+        return '&'.join(['%s=%s' % (escape(str(k)), escape(str(v))) \
+            for k, v in self.get_nonoauth_parameters().iteritems()])
 
     def to_url(self):
         """Serialize as a URL for a GET request."""
@@ -334,7 +349,7 @@ class OAuthRequest(object):
             parameters = {}
 
         parameters['oauth_token'] = token.key
-
+        
         if callback:
             parameters['oauth_callback'] = callback
 
@@ -418,9 +433,24 @@ class OAuthServer(object):
         except OAuthError:
             verifier = None
         # Get the request token.
-        token = self._get_token(oauth_request, 'request')
+        if consumer.supports_xauth == True and self._get_x_auth_mode(oauth_request) == "client_auth":
+            username = self._get_x_auth_username(oauth_request)
+            password = self._get_x_auth_password(oauth_request)
+            
+            if username is not None and password is not None:
+                userid = self.data_store.fetch_userid(username,password)
+                
+            if userid is None and consumer.supports_deferred_auth == False:
+                raise OAuthError("missing required username/password")
+        else:
+            token = self._get_token(oauth_request, 'request')
+            if token.userid is None:
+                raise OAuthError("unauthorized")
+            userid = token.userid
+        
+        
         self._check_signature(oauth_request, consumer, token)
-        new_token = self.data_store.fetch_access_token(consumer, token, verifier)
+        new_token = self.data_store.fetch_access_token(consumer, token, verifier, userid)
         return new_token
 
     def verify_request(self, oauth_request):
@@ -490,7 +520,25 @@ class OAuthServer(object):
     
     def _get_verifier(self, oauth_request):
         return oauth_request.get_parameter('oauth_verifier')
-
+    
+    def _get_x_auth_mode(self, oauth_request):
+        try:
+            return oauth_request.get_parameter('x_auth_mode')
+        except:
+            return "web"
+    
+    def _get_x_auth_username(self, oauth_request):
+        try:
+            return oauth_request.get_parameter('x_auth_username')
+        except:
+            return None
+    
+    def _get_x_auth_password(self, oauth_request):
+        try:
+            return oauth_request.get_parameter('x_auth_password')
+        except:
+            return None
+    
     def _check_signature(self, oauth_request, consumer, token):
         timestamp, nonce = oauth_request._get_timestamp_nonce()
         self._check_timestamp(timestamp)
@@ -562,7 +610,7 @@ class OAuthDataStore(object):
         """-> OAuthConsumer."""
         raise NotImplementedError
 
-    def lookup_token(self, oauth_consumer, token_type, token_token):
+    def lookup_token(self, token_type, token_token):
         """-> OAuthToken."""
         raise NotImplementedError
 
@@ -574,7 +622,7 @@ class OAuthDataStore(object):
         """-> OAuthToken."""
         raise NotImplementedError
 
-    def fetch_access_token(self, oauth_consumer, oauth_token, oauth_verifier):
+    def fetch_access_token(self, oauth_consumer, oauth_token, oauth_verifier, userid):
         """-> OAuthToken."""
         raise NotImplementedError
 
@@ -582,6 +630,10 @@ class OAuthDataStore(object):
         """-> OAuthToken."""
         raise NotImplementedError
 
+    def fetch_userid(self,username,password):
+        """-> int"""
+        raise NotImplementedError
+        
 
 class OAuthSignatureMethod(object):
     """A strategy class that implements a signature method."""
